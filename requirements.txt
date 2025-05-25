@@ -1,0 +1,16 @@
+# WhatsApp Router Service Dependencies
+# Core web framework and cloud functions
+flask==3.0.3
+functions-framework==3.8.1
+
+# Google Cloud services
+google-cloud-firestore==2.16.0
+
+# HTTP requests for forwarding messages
+requests==2.32.3
+
+# Optional: For better logging and debugging (already included in Python)
+# logging - built-in
+
+# Optional: For type hints (Python 3.9+ has most of these built-in)
+# typing - built-in for Python 3.5+

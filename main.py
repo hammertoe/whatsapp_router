@@ -40,6 +40,7 @@ WHATSAPP_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v19.0")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
 FIRESTORE_PROJECT = os.getenv("FIRESTORE_PROJECT")
 FIRESTORE_DATABASE = os.getenv("FIRESTORE_DATABASE", "(default)")
+ADMIN_SECRET = os.getenv("ADMIN_SECRET")  # New admin authentication secret
 
 class RouteAction(Enum):
     """Actions that can be taken when routing a message."""
@@ -113,6 +114,68 @@ class RoutingDatabase:
     def __init__(self, project: Optional[str] = None, database: Optional[str] = None):
         self.db = firestore.Client(project=project, database=database)
         self.rules_collection = self.db.collection("whatsapp_routing_rules")
+    
+    def _add_rule_via_api(self, rule_data: Dict[str, Any]) -> None:
+        """Add rule via API (internal method)."""
+        try:
+            action = RouteAction(rule_data.get('rule_action', 'hold').lower())
+        except ValueError:
+            raise ValueError(f"Invalid action: {rule_data.get('rule_action')}")
+        
+        rule = RoutingRule(
+            user_id=rule_data.get('user_id'),
+            user_pattern=rule_data.get('user_pattern'),
+            action=action,
+            target_url=rule_data.get('target_url'),
+            hold_message=rule_data.get('hold_message'),
+            priority=rule_data.get('priority', 0)
+        )
+        
+        doc_id = rule.user_id or rule.user_pattern or f"pattern_{rule.priority}"
+        rule_dict = rule.__dict__.copy()
+        rule_dict['action'] = rule.action.value
+        self.rules_collection.document(doc_id).set(rule_dict)
+    
+    def _remove_rule_via_api(self, identifier: str) -> None:
+        """Remove rule via API (internal method)."""
+        self.rules_collection.document(identifier).delete()
+    
+    def _set_default_rule_via_api(self, rule_data: Dict[str, Any]) -> None:
+        """Set default rule via API (internal method)."""
+        try:
+            action = RouteAction(rule_data.get('rule_action', 'hold').lower())
+        except ValueError:
+            raise ValueError(f"Invalid action: {rule_data.get('rule_action')}")
+        
+        rule = RoutingRule(
+            action=action,
+            target_url=rule_data.get('target_url'),
+            hold_message=rule_data.get('hold_message'),
+            priority=0
+        )
+        
+        rule_dict = rule.__dict__.copy()
+        rule_dict['action'] = rule.action.value
+        self.rules_collection.document("default").set(rule_dict)
+    
+    def get_all_rules(self) -> List[RoutingRule]:
+        """Get all routing rules."""
+        rules = []
+        try:
+            docs = self.rules_collection.get()
+            for doc in docs:
+                data = doc.to_dict()
+                if data and 'action' in data:
+                    data['action'] = RouteAction(data['action'])
+                    rules.append(RoutingRule(**data))
+            
+            # Sort by priority (highest first)
+            rules.sort(key=lambda r: r.priority, reverse=True)
+            
+        except Exception as e:
+            logger.error(f"Error getting all routing rules: {e}")
+            
+        return rules
         
     def get_routing_rules(self, user_id: str) -> List[RoutingRule]:
         """Get routing rules for a specific user, sorted by priority."""
@@ -233,6 +296,19 @@ class WhatsAppRouter:
         else:
             logger.warning(f"Invalid verification token: {verify_token}")
             return False, "Invalid verification token"
+    
+    def verify_admin_access(self, provided_secret: str) -> bool:
+        """Verify admin access using shared secret."""
+        if not ADMIN_SECRET:
+            logger.warning("ADMIN_SECRET not configured - admin access denied")
+            return False
+        
+        if provided_secret == ADMIN_SECRET:
+            logger.info("Admin access granted")
+            return True
+        else:
+            logger.warning("Invalid admin secret provided")
+            return False
     
     def process_webhook(self, body: Dict[str, Any]) -> str:
         """Process incoming webhook and route messages."""
@@ -394,28 +470,85 @@ def main_handler(request_obj: flask_request):
 
     # Admin endpoint to check routing rules
     elif path == "/admin/rules" and method == "GET":
+        # Check admin authentication
+        auth_header = request_obj.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return abort(401, "Missing or invalid Authorization header. Use: Authorization: Bearer <secret>")
+        
+        provided_secret = auth_header.replace('Bearer ', '')
+        if not router.verify_admin_access(provided_secret):
+            return abort(403, "Invalid admin secret")
+        
         try:
             user_id = request_obj.args.get("user_id")
-            if not user_id:
-                return abort(400, "user_id parameter required")
             
-            rules = router.routing_db.get_routing_rules(user_id)
-            rules_data = []
-            for rule in rules:
-                rules_data.append({
-                    "user_id": rule.user_id,
-                    "user_pattern": rule.user_pattern,
-                    "action": rule.action.value,
-                    "target_url": rule.target_url,
-                    "hold_message": rule.hold_message,
-                    "priority": rule.priority
-                })
-            
-            return make_response({"user_id": user_id, "rules": rules_data}, 200)
+            if user_id:
+                # Get rules for specific user
+                rules = router.routing_db.get_routing_rules(user_id)
+                rules_data = []
+                for rule in rules:
+                    rules_data.append({
+                        "user_id": rule.user_id,
+                        "user_pattern": rule.user_pattern,
+                        "action": rule.action.value,
+                        "target_url": rule.target_url,
+                        "hold_message": rule.hold_message,
+                        "priority": rule.priority
+                    })
+                return make_response({"user_id": user_id, "rules": rules_data}, 200)
+            else:
+                # Get all rules
+                all_rules = router.routing_db.get_all_rules()
+                rules_data = []
+                for rule in all_rules:
+                    rules_data.append({
+                        "user_id": rule.user_id,
+                        "user_pattern": rule.user_pattern,
+                        "action": rule.action.value,
+                        "target_url": rule.target_url,
+                        "hold_message": rule.hold_message,
+                        "priority": rule.priority
+                    })
+                return make_response({"rules": rules_data}, 200)
             
         except Exception as e:
             logger.error(f"Error retrieving rules: {e}", exc_info=True)
             return abort(500, "Error retrieving rules")
+
+    # Admin endpoint to manage rules via API
+    elif path == "/admin/rules" and method == "POST":
+        # Check admin authentication
+        auth_header = request_obj.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return abort(401, "Missing or invalid Authorization header. Use: Authorization: Bearer <secret>")
+        
+        provided_secret = auth_header.replace('Bearer ', '')
+        if not router.verify_admin_access(provided_secret):
+            return abort(403, "Invalid admin secret")
+        
+        try:
+            body = request_obj.get_json(silent=True) or {}
+            action = body.get('action')
+            
+            if action == 'add_rule':
+                router.routing_db._add_rule_via_api(body)
+                return make_response({"status": "success", "message": "Rule added"}, 200)
+            elif action == 'remove_rule':
+                identifier = body.get('identifier')
+                if identifier:
+                    router.routing_db._remove_rule_via_api(identifier)
+                    return make_response({"status": "success", "message": "Rule removed"}, 200)
+                else:
+                    return abort(400, "identifier required for remove_rule")
+            elif action == 'set_default':
+                router.routing_db._set_default_rule_via_api(body)
+                return make_response({"status": "success", "message": "Default rule set"}, 200)
+            else:
+                return abort(400, "Invalid action. Use: add_rule, remove_rule, or set_default")
+                
+        except Exception as e:
+            logger.error(f"Error managing rules via API: {e}", exc_info=True)
+            return abort(500, "Error managing rules")
             
     else:
         return abort(404, f"Path {path} not found")
@@ -431,7 +564,7 @@ if HAS_FUNCTIONS_FRAMEWORK:
 if __name__ == "__main__":
     app = Flask(__name__)
     
-    # Check configuration
+    # Check required configurations
     required_configs = [
         ("PHONE_NUMBER_ID", PHONE_NUMBER_ID),
         ("WABA_ACCESS_TOKEN", WABA_ACCESS_TOKEN),
@@ -448,6 +581,11 @@ if __name__ == "__main__":
     else:
         print("✅ All required configurations present")
     
+    if not ADMIN_SECRET:
+        print("⚠️  WARNING: ADMIN_SECRET not set - admin endpoints will be disabled")
+    else:
+        print("✅ Admin authentication configured")
+    
     if not router:
         print("❌ CRITICAL: WhatsApp Router NOT INITIALIZED.")
     else:
@@ -461,7 +599,7 @@ if __name__ == "__main__":
     def webhook():
         return main_handler(flask_request)
     
-    @app.route("/admin/rules", methods=["GET"])
+    @app.route("/admin/rules", methods=["GET", "POST"])
     def admin():
         return main_handler(flask_request)
     
@@ -474,6 +612,7 @@ if __name__ == "__main__":
     print("   PHONE_NUMBER_ID")
     print("   WABA_ACCESS_TOKEN") 
     print("   WHATSAPP_VERIFY_TOKEN")
+    print("   ADMIN_SECRET (for admin endpoints)")
     print("   FIRESTORE_PROJECT (optional)")
     print("   FIRESTORE_DATABASE (optional, defaults to '(default)')")
     

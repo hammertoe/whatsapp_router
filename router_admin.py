@@ -7,6 +7,7 @@ Standalone version for the router service.
 import argparse
 import logging
 import os
+import requests
 from enum import Enum
 from dataclasses import dataclass
 from typing import Optional
@@ -34,12 +35,25 @@ class RoutingRule:
 class RouterAdmin:
     """Admin interface for managing routing rules."""
     
-    def __init__(self, project: Optional[str] = None, database: Optional[str] = None):
-        self.db = firestore.Client(project=project, database=database)
-        self.rules_collection = self.db.collection("whatsapp_routing_rules")
-        print(f"Connected to Firestore project: {project or 'default'}")
-        print(f"Using database: {database or '(default)'}")
-        print(f"Collection: whatsapp_routing_rules")
+    def __init__(self, project: Optional[str] = None, database: Optional[str] = None, 
+                 use_api: bool = False, api_url: Optional[str] = None, admin_secret: Optional[str] = None):
+        self.use_api = use_api
+        self.api_url = api_url
+        self.admin_secret = admin_secret
+        
+        if use_api:
+            if not api_url:
+                raise ValueError("api_url required when use_api=True")
+            if not admin_secret:
+                raise ValueError("admin_secret required when use_api=True")
+            print(f"Using API mode: {api_url}")
+            print("Admin secret configured")
+        else:
+            self.db = firestore.Client(project=project, database=database)
+            self.rules_collection = self.db.collection("whatsapp_routing_rules")
+            print(f"Connected to Firestore project: {project or 'default'}")
+            print(f"Using database: {database or '(default)'}")
+            print(f"Collection: whatsapp_routing_rules")
     
     def add_rule(
         self, 
@@ -66,10 +80,49 @@ class RouterAdmin:
             print("❌ --target-url is required for 'forward' action")
             return
         
+        if self.use_api:
+            self._add_rule_via_api(action, user_id, user_pattern, target_url, hold_message, priority)
+        else:
+            self._add_rule_direct(action, user_id, user_pattern, target_url, hold_message, priority)
+    
+    def _add_rule_via_api(self, action: str, user_id: Optional[str], user_pattern: Optional[str], 
+                         target_url: Optional[str], hold_message: Optional[str], priority: int):
+        """Add rule via API."""
+        try:
+            payload = {
+                "action": "add_rule",
+                "rule_action": action,
+                "user_id": user_id,
+                "user_pattern": user_pattern,
+                "target_url": target_url,
+                "hold_message": hold_message,
+                "priority": priority
+            }
+            
+            headers = {"Authorization": f"Bearer {self.admin_secret}"}
+            response = requests.post(f"{self.api_url}/admin/rules", json=payload, headers=headers)
+            
+            if response.status_code == 200:
+                print(f"✅ Added routing rule for {user_id or user_pattern}")
+                print(f"   Action: {action}")
+                if target_url:
+                    print(f"   Target URL: {target_url}")
+                if hold_message:
+                    print(f"   Hold message: {hold_message}")
+                print(f"   Priority: {priority}")
+            else:
+                print(f"❌ Failed to add rule: {response.status_code} {response.text}")
+                
+        except Exception as e:
+            print(f"❌ Error adding rule via API: {e}")
+    
+    def _add_rule_direct(self, action: str, user_id: Optional[str], user_pattern: Optional[str], 
+                        target_url: Optional[str], hold_message: Optional[str], priority: int):
+        """Add rule directly to Firestore."""
         rule = RoutingRule(
             user_id=user_id,
             user_pattern=user_pattern,
-            action=route_action,
+            action=RouteAction(action.lower()),
             target_url=target_url,
             hold_message=hold_message,
             priority=priority
@@ -92,11 +145,57 @@ class RouterAdmin:
     
     def list_rules(self, user_id: Optional[str] = None):
         """List routing rules."""
+        if self.use_api:
+            self._list_rules_via_api(user_id)
+        else:
+            self._list_rules_direct(user_id)
+    
+    def _list_rules_via_api(self, user_id: Optional[str] = None):
+        """List rules via API."""
+        try:
+            headers = {"Authorization": f"Bearer {self.admin_secret}"}
+            
+            if user_id:
+                # Get rules for specific user
+                response = requests.get(f"{self.api_url}/admin/rules?user_id={user_id}", headers=headers)
+                title = f"📋 Routing rules for user {user_id}:"
+                rules_key = 'rules'
+            else:
+                # Get all rules
+                response = requests.get(f"{self.api_url}/admin/rules", headers=headers)
+                title = f"📋 All routing rules:"
+                rules_key = 'rules'
+            
+            if response.status_code == 200:
+                data = response.json()
+                rules = data.get(rules_key, [])
+                print(f"\n{title}")
+                
+                if not rules:
+                    print("   No rules found")
+                    return
+                
+                for i, rule in enumerate(rules, 1):
+                    print(f"\n   Rule {i}:")
+                    print(f"     User ID: {rule.get('user_id') or 'N/A'}")
+                    print(f"     User Pattern: {rule.get('user_pattern') or 'N/A'}")
+                    print(f"     Action: {rule.get('action')}")
+                    print(f"     Target URL: {rule.get('target_url') or 'N/A'}")
+                    print(f"     Hold Message: {rule.get('hold_message') or 'N/A'}")
+                    print(f"     Priority: {rule.get('priority')}")
+            else:
+                print(f"❌ Failed to list rules: {response.status_code} {response.text}")
+                
+        except Exception as e:
+            print(f"❌ Error listing rules via API: {e}")
+    
+    def _list_rules_direct(self, user_id: Optional[str] = None):
+        """List routing rules."""
         try:
             if user_id:
                 print(f"\n📋 Routing rules for user {user_id}:")
                 # Get user-specific rules
-                user_docs = self.rules_collection.where("user_id", "==", user_id).get()
+                user_docs = self.rules_collection.where(filter=firestore.FieldFilter("user_id", "==", user_id)).get()
                 rules = []
                 for doc in user_docs:
                     data = doc.to_dict()
@@ -104,15 +203,21 @@ class RouterAdmin:
                         data['action'] = RouteAction(data['action'])
                         rules.append(RoutingRule(**data))
                 
-                # Get pattern-based rules that might match
-                pattern_docs = self.rules_collection.where("user_pattern", "!=", None).get()
-                for doc in pattern_docs:
+                # Get all docs and filter pattern-based rules in code
+                all_docs = self.rules_collection.get()
+                for doc in all_docs:
                     data = doc.to_dict()
-                    if data and 'action' in data:
-                        data['action'] = RouteAction(data['action'])
-                        rule = RoutingRule(**data)
-                        if rule.user_pattern and self._matches_pattern(user_id, rule.user_pattern):
-                            rules.append(rule)
+                    # Skip if this is the user-specific rule we already got
+                    if data.get('user_id') == user_id:
+                        continue
+                        
+                    # Check if this is a pattern-based rule that matches
+                    if data.get('user_pattern') and data.get('user_pattern') != "":
+                        if 'action' in data:
+                            data['action'] = RouteAction(data['action'])
+                            rule = RoutingRule(**data)
+                            if self._matches_pattern(user_id, rule.user_pattern):
+                                rules.append(rule)
                 
                 # Sort by priority
                 rules.sort(key=lambda r: r.priority, reverse=True)
@@ -148,6 +253,28 @@ class RouterAdmin:
     
     def remove_rule(self, identifier: str):
         """Remove a routing rule by user_id or pattern."""
+        if self.use_api:
+            self._remove_rule_via_api(identifier)
+        else:
+            self._remove_rule_direct(identifier)
+    
+    def _remove_rule_via_api(self, identifier: str):
+        """Remove rule via API."""
+        try:
+            payload = {"action": "remove_rule", "identifier": identifier}
+            headers = {"Authorization": f"Bearer {self.admin_secret}"}
+            response = requests.post(f"{self.api_url}/admin/rules", json=payload, headers=headers)
+            
+            if response.status_code == 200:
+                print(f"✅ Removed routing rule for {identifier}")
+            else:
+                print(f"❌ Failed to remove rule: {response.status_code} {response.text}")
+                
+        except Exception as e:
+            print(f"❌ Error removing rule via API: {e}")
+    
+    def _remove_rule_direct(self, identifier: str):
+        """Remove rule directly from Firestore."""
         try:
             doc_ref = self.rules_collection.document(identifier)
             doc = doc_ref.get()
@@ -175,8 +302,40 @@ class RouterAdmin:
             print("❌ --target-url is required for 'forward' action")
             return
         
+        if self.use_api:
+            self._set_default_rule_via_api(action, target_url, hold_message)
+        else:
+            self._set_default_rule_direct(action, target_url, hold_message)
+    
+    def _set_default_rule_via_api(self, action: str, target_url: Optional[str], hold_message: Optional[str]):
+        """Set default rule via API."""
+        try:
+            payload = {
+                "action": "set_default",
+                "rule_action": action,
+                "target_url": target_url,
+                "hold_message": hold_message
+            }
+            
+            headers = {"Authorization": f"Bearer {self.admin_secret}"}
+            response = requests.post(f"{self.api_url}/admin/rules", json=payload, headers=headers)
+            
+            if response.status_code == 200:
+                print(f"✅ Set default routing rule: {action}")
+                if target_url:
+                    print(f"   Target URL: {target_url}")
+                if hold_message:
+                    print(f"   Hold message: {hold_message}")
+            else:
+                print(f"❌ Failed to set default rule: {response.status_code} {response.text}")
+                
+        except Exception as e:
+            print(f"❌ Error setting default rule via API: {e}")
+    
+    def _set_default_rule_direct(self, action: str, target_url: Optional[str], hold_message: Optional[str]):
+        """Set default rule directly in Firestore."""
         rule = RoutingRule(
-            action=route_action,
+            action=RouteAction(action.lower()),
             target_url=target_url,
             hold_message=hold_message,
             priority=0
@@ -236,6 +395,12 @@ def main():
                        default=os.getenv("FIRESTORE_PROJECT"))
     parser.add_argument("--database", help="Firestore database name", 
                        default=os.getenv("FIRESTORE_DATABASE", "(default)"))
+    parser.add_argument("--api-url", help="Router service URL (for API mode)", 
+                       default=os.getenv("ROUTER_API_URL"))
+    parser.add_argument("--admin-secret", help="Admin secret for API authentication", 
+                       default=os.getenv("ADMIN_SECRET"))
+    parser.add_argument("--use-api", action="store_true", 
+                       help="Use API mode instead of direct Firestore access")
     
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
     
@@ -274,7 +439,13 @@ def main():
         return
     
     try:
-        admin = RouterAdmin(project=args.project, database=args.database)
+        admin = RouterAdmin(
+            project=args.project, 
+            database=args.database,
+            use_api=args.use_api,
+            api_url=args.api_url,
+            admin_secret=args.admin_secret
+        )
         
         if args.command == "add":
             admin.add_rule(
@@ -311,33 +482,28 @@ if __name__ == "__main__":
 
 # Example usage:
 """
-# Set default rule to forward to main bot
-python router_admin.py default forward --target-url https://my-main-bot.run.app/webhook/whatsapp
+# Direct Firestore access (requires Firestore credentials)
+python router_admin.py default forward --target-url https://main-bot.run.app/webhook/whatsapp
 
-# Route specific user to test bot
-python router_admin.py add forward --user-id 1234567890 --target-url https://test-bot.run.app/webhook/whatsapp
+# API mode (requires ADMIN_SECRET)
+export ADMIN_SECRET="your-strong-secret-here"
+export ROUTER_API_URL="https://your-router.run.app"
 
-# Route all test users to test environment
-python router_admin.py add forward --user-pattern "test*" --target-url https://test-bot.run.app/webhook/whatsapp --priority 10
+python router_admin.py --use-api default forward --target-url https://main-bot.run.app/webhook/whatsapp
 
-# Put a user on hold
-python router_admin.py add hold --user-id 9876543210 --hold-message "Account under review. Contact support."
+# API mode with explicit parameters
+python router_admin.py --use-api --api-url https://your-router.run.app --admin-secret your-secret \
+  add forward --user-id 1234567890 --target-url https://test-bot.run.app/webhook/whatsapp
 
-# Block a user
-python router_admin.py add block --user-id 5555555555
+# List rules for user (API mode)
+python router_admin.py --use-api list --user-id 1234567890
 
-# List all rules
-python router_admin.py list
+# Set environment variables for easier API usage
+export ADMIN_SECRET="your-strong-secret-here"
+export ROUTER_API_URL="https://your-router.run.app"
 
-# List rules that would apply to specific user
-python router_admin.py list --user-id 1234567890
-
-# Remove a rule
-python router_admin.py remove 1234567890
-
-# Show statistics
-python router_admin.py stats
-
-# Use with specific Firestore project
-python router_admin.py --project my-project-id --database my-db list
+# Then you can use shorter commands
+python router_admin.py --use-api add hold --user-id 9876543210 --hold-message "Maintenance mode"
+python router_admin.py --use-api remove 1234567890
+python router_admin.py --use-api default forward --target-url https://main-bot.run.app/webhook/whatsapp
 """
